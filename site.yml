@@ -1,0 +1,264 @@
+---
+- name: Install ClickHouse
+  hosts: clickhouse
+  gather_facts: true
+  become: true
+  handlers:
+    - name: Restart clickhouse
+      ansible.builtin.systemd:
+        name: clickhouse-server
+        state: restarted
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - net-tools
+        state: present
+
+    - name: Download ClickHouse GPG key
+      ansible.builtin.get_url:
+        url: "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x8919F6BD2B48D754"
+        dest: "/tmp/clickhouse.gpg"
+        mode: '0644'
+
+    - name: Add ClickHouse GPG key
+      ansible.builtin.apt_key:
+        file: "/tmp/clickhouse.gpg"
+        state: present
+
+    - name: Add ClickHouse repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://packages.clickhouse.com/deb stable main"
+        state: present
+        update_cache: true
+
+    - name: Install ClickHouse packages
+      ansible.builtin.apt:
+        name:
+          - clickhouse-server
+          - clickhouse-client
+        state: present
+
+    - name: Configure ClickHouse to listen on all interfaces
+      ansible.builtin.replace:
+        path: /etc/clickhouse-server/config.xml
+        regexp: '<!-- <listen_host>::</listen_host> -->'
+        replace: '<listen_host>::</listen_host>'
+      notify: Restart clickhouse
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for ClickHouse to start
+      ansible.builtin.wait_for:
+        port: 8123
+        host: localhost
+        timeout: 60
+        delay: 5
+
+    - name: Create database
+      ansible.builtin.command: "clickhouse-client -q 'create database if not exists logs;'"
+      register: create_db
+      changed_when: create_db.stdout is defined and 'already exists' not in create_db.stdout
+      failed_when: false
+
+- name: Install Vector
+  hosts: vector
+  gather_facts: true
+  become: true
+  handlers:
+    - name: Restart vector
+      ansible.builtin.systemd:
+        name: vector
+        state: restarted
+
+  tasks:
+    - name: Ensure DNS is configured
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/resolv.conf
+        line: "nameserver 8.8.8.8"
+        insertbefore: BOF
+      register: dns_config
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - curl
+          - tar
+        state: present
+
+    - name: Download Vector from GitHub
+      ansible.builtin.get_url:
+        url: "https://github.com/vectordotdev/vector/releases/download/v0.21.1/vector-0.21.1-x86_64-unknown-linux-gnu.tar.gz"
+        dest: "/tmp/vector.tar.gz"
+        mode: '0644'
+      register: download_vector
+      until: download_vector is success
+      retries: 3
+      delay: 5
+
+    - name: Extract Vector
+      ansible.builtin.unarchive:
+        src: "/tmp/vector.tar.gz"
+        dest: "/tmp"
+        remote_src: true
+        creates: "/tmp/vector-x86_64-unknown-linux-gnu/bin/vector"
+
+    - name: Install Vector binary
+      ansible.builtin.copy:
+        src: "/tmp/vector-x86_64-unknown-linux-gnu/bin/vector"
+        dest: "/usr/bin/vector"
+        mode: '0755'
+        remote_src: true
+
+    - name: Create Vector config directory
+      ansible.builtin.file:
+        path: /etc/vector
+        state: directory
+        mode: '0755'
+
+    - name: Create Vector config file
+      ansible.builtin.template:
+        src: vector.yml.j2
+        dest: /etc/vector/vector.yaml
+        mode: '0644'
+      notify: Restart vector
+
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/vector.tar.gz"
+        - "/tmp/vector-x86_64-unknown-linux-gnu"
+
+    - name: Create systemd service for Vector
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vector.service
+        content: |
+          [Unit]
+          Description=Vector
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=root
+          Group=root
+          ExecStart=/usr/bin/vector --config /etc/vector/vector.yaml
+          Restart=always
+          RestartSec=10
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+      notify: Restart vector
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start Vector
+      ansible.builtin.systemd:
+        name: vector
+        state: started
+        enabled: true
+
+- name: Install Lighthouse
+  hosts: lighthouse
+  gather_facts: true
+  become: true
+  vars:
+    lighthouse_dir: "/var/www/lighthouse"
+
+  tasks:
+    - name: Ensure DNS is configured
+      ansible.builtin.lineinfile:
+        path: /etc/resolv.conf
+        line: "nameserver 8.8.8.8"
+        insertbefore: BOF
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install nginx and git
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - git
+        state: present
+
+    - name: Remove existing lighthouse directory if exists
+      ansible.builtin.file:
+        path: "{{ lighthouse_dir }}"
+        state: absent
+
+    - name: Create lighthouse directory
+      ansible.builtin.file:
+        path: "{{ lighthouse_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Clone Lighthouse repository
+      ansible.builtin.git:
+        repo: "https://github.com/VKCOM/lighthouse.git"
+        dest: "{{ lighthouse_dir }}"
+        version: master
+        force: true
+
+    - name: Set correct permissions for lighthouse
+      ansible.builtin.file:
+        path: "{{ lighthouse_dir }}"
+        owner: www-data
+        group: www-data
+        recurse: true
+        state: directory
+
+    - name: Remove default nginx sites
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/nginx/sites-enabled/default
+        - /etc/nginx/sites-available/default
+
+    - name: Configure nginx for Lighthouse
+      ansible.builtin.template:
+        src: lighthouse.conf.j2
+        dest: /etc/nginx/sites-available/lighthouse
+        mode: '0644'
+
+    - name: Enable lighthouse site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/lighthouse
+        dest: /etc/nginx/sites-enabled/lighthouse
+        state: link
+
+    - name: Test nginx configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: true
